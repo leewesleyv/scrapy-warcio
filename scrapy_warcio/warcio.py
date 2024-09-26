@@ -1,65 +1,23 @@
-'''
-ScrapyWarcIo class
-~~~~~~~~~~~~~~~~~~
-'''
-
+from io import BytesIO
 import logging
 import os
 import socket
 import sys
+from urllib.parse import urlparse
 import uuid
+from warcio.statusandheaders import StatusAndHeaders
+from warcio.warcwriter import WARCWriter
 
-from datetime import datetime
+from datetime import datetime, timezone
 
-try:
-    from urllib.parse import urlparse
-except ImportError:
-    from urlparse import urlparse
-
-import magic
-import yaml
-
-from hanzo import warctools  # internetarchive/warctools
 from scrapy import __version__ as scrapy_version
 
-
-def _bytes(val):
-    '''
-    always returns bytes from str or bytes
-    '''
-    return val if isinstance(val, bytes) else bytes(val, 'utf-8')
-
-
-def _str(val):
-    '''
-    always returns string from str or bytes
-    '''
-    return val if isinstance(val, str) else str(val, 'utf-8')
-
-
-def warc_date():
-    '''
-    returns UTC now in WARC-Date format (YYYY-mm-ddTHH:ii:ssZ)
-    '''
-    return datetime.utcnow().isoformat() + 'Z'
+from scrapy_warcio.utils import warc_date
 
 
 class ScrapyWarcIo:
+    """Scrapy DownloaderMiddleware WARC input/output methods"""
 
-    '''
-    Scrapy DownloaderMiddleware WARC input/output methods
-    '''
-
-    REQUIRED = [
-        'collection',
-        'description',
-        'max_warc_size',
-        'operator',
-        'robots',
-        'user_agent',
-        'warc_dest',
-        'warc_prefix',
-        'warc_spec']
     WARC_LINE_SEP = '\r\n'
     WARC_SERIAL_ZFILL = 5
 
@@ -73,22 +31,28 @@ class ScrapyWarcIo:
         self.max_serial = int('9' * self.WARC_SERIAL_ZFILL)
         self.req_date_set = False
 
-        with open(os.environ.get('SCRAPY_WARCIO_SETTINGS')) as sfh:
-            self.config = yaml.safe_load(sfh.read())
-
-        for item in self.REQUIRED:
-            if self.config.get(item) is None:
-                raise ValueError(
-                    'required config item: {} is None'.format(item))
+        # TODO: Replace config with different implementation.
+        self.config = {
+            'warc_spec': 'https://iipc.github.io/warc-specifications/specifications/warc-format/warc-1.0/',
+            'max_warc_size': 10000000000,  # 10GB
+            'collection': 'quotes',
+            'description': 'description',
+            'operator': 'john@doe.nl',
+            'robots': 'obey',  # robots policy `obey`` or `ignore``
+            'user_agent': '', # TODO: from spider settings?
+            'warc_prefix': 'rec',
+            'warc_dest': '', # WARC files destination
+        }
 
     def bump_serial(self, content_bytes):
-        '''
-        increment WARC serial number and create a new WARC file iff
+        """
+        Increment WARC serial number and create a new WARC file if
         file size + (uncompressed) additional content may exceed
-        max_warc_size in settings
+        max_warc_size.
 
-        :param  content_bytes  size in bytes of new content (uncompressed)
-        '''
+        :param content_bytes  size in bytes of new content (uncompressed)
+        """
+
         create_new_warc = False
 
         if self.warc_fname is None:
@@ -106,15 +70,8 @@ class ScrapyWarcIo:
             self.write_warcinfo()
             self.warc_count += 1
 
-    @staticmethod
-    def __record_id():
-        '''
-        returns WARC-Record-ID (globally unique UUID) as a string
-        '''
-        return '<urn:uuid:{}>'.format(uuid.uuid1())
-
     def get_headers(self, record):
-        '''
+        """
         returns WARC record headers as a string from Scrapy object
 
         if record.method, returns request headers
@@ -122,7 +79,8 @@ class ScrapyWarcIo:
         else raises ValueError
 
         :param  record  <scrapy.http.Request> or <scrapy.http.Response>
-        '''
+        """
+
         if not hasattr(record, 'headers'):
             return ''
 
@@ -138,25 +96,25 @@ class ScrapyWarcIo:
 
         for key in record.headers:
             val = record.headers[key]
-            headers.append('{}: {}'.format(_str(key), _str(val)))
+            headers.append('{}: {}'.format(str(key), str(val)))
 
         return self.WARC_LINE_SEP.join(headers)
 
     def warcfile(self):
-        '''
-        returns new WARC filename from warc_prefix setting and current
-        WARC count. WARC filename format compatible with
-        internetarchive/draintasker warc naming #1:
+        """
+        Returns new WARC filename from warc_prefix setting and current WARC count. 
+        WARC filename format compatible with internetarchive/draintasker warc naming #1:
         {TLA}-{timestamp}-{serial}-{fqdn}.warc.gz
 
-        raises IOError if WARC file exists
-        '''
+        Raises IOError if WARC file exists or destination is not found.
+        """
+
         if self.warc_count > self.max_serial:
             raise ValueError('warc_count: {} exceeds max_serial: {}'.format(
                 self.warc_count, self.max_serial))
 
         tla = self.config['warc_prefix']
-        timestamp = datetime.utcnow().strftime('%Y%m%d%H%M%S')
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')
         serial = str(self.warc_count).zfill(self.WARC_SERIAL_ZFILL)
         fqdn = socket.gethostname().split('.')[0]
 
@@ -174,7 +132,7 @@ class ScrapyWarcIo:
         return fname
 
     def write(self, response, request):
-        '''
+        """
         write WARC-Type: response, then WARC-Type: request records
         from Scrapy response and request
 
@@ -185,9 +143,10 @@ class ScrapyWarcIo:
         2) The WARC-Date of the response must be identical to the
            WARC-Date of the request.
 
-        :param  response  <scrapy.http.Response>
-        :param  request   <scrapy.http.Request>
-        '''
+        :param response  <scrapy.http.Response>
+        :param request   <scrapy.http.Request>
+        """
+
         if not hasattr(response, 'status'):
             raise ValueError('Response missing HTTP status')
 
@@ -212,53 +171,60 @@ class ScrapyWarcIo:
             ('WARC-Record-ID', record_id),
         ]
 
-        body = response.body
-        mimetype = magic.from_buffer(body, mime=True)
-        content = '{}{}{}'.format(self.get_headers(response),
-                                  self.WARC_LINE_SEP * 2,
-                                  _str(body))
-
+        content = f'{self.get_headers(response)}{self.WARC_LINE_SEP * 2}{str(response.body)}'
+        
+        mimetype = None # mimetypes.guess_type(_str(body))[0]
         if mimetype:
             warc_headers.append(('WARC-Identified-Payload-Type', mimetype))
 
         # write response
-        self.write_record(headers=warc_headers,
-                          content_type='application/http;msgtype=response',
-                          content=content)
+        self.write_record(
+            headers=warc_headers,
+            content_type='application/http;msgtype=response',
+            content=content
+        )
 
         self.write_request(request, record_id)
 
     def write_record(self, headers, content_type, content):
-        '''
-        write WARC record (of any type) to WARC GZ file
+        """
+        Write WARC record (of any type) to WARC GZ file
 
-        :param  headers       list of header tuples [('foo', 'bar')]
-        :param  content_type  WARC Content-Type header string
-        :param  content       WARC payload
-        '''
+        :param headers       list of header tuples [('foo', 'bar')]
+        :param content_type  WARC Content-Type header string
+        :param content       WARC payload
+        """
         self.bump_serial(sys.getsizeof(content))
 
         bheaders = []
         for key, val in headers:
-            bheaders.append((_bytes(key), _bytes(val)))
+            bheaders.append((bytes(key, 'utf-8'), bytes(val, 'utf-8')))
 
         with open(self.warc_fname, 'ab') as _fh:
-            record = warctools.WarcRecord(
-                headers=bheaders,
-                content=(_bytes(content_type), _bytes(content)))
+            writer = WARCWriter(_fh, gzip=True)
 
-            record.write_to(_fh, gzip=True)
+            http_headers = StatusAndHeaders(
+                statusline='200 OK',
+                headers=headers,
+                protocol='HTTPS',
+            )
 
-            self.log.info('Wrote %s bytes (%s) to file: %s',
-                          _fh.tell(), content_type, self.warc_fname)
+            record = writer.create_warc_record(
+                uri='https://www.test.nl',
+                record_type="response",
+                payload=BytesIO(bytes(content, 'utf-8')),
+                http_headers=http_headers,
+            )
+
+            writer.write_record(record)
 
     def write_request(self, request, concurrent_to):
-        '''
+        """
         write WARC-Type: request record from Scrapy response
 
         :param  request        <scrapy.http.Request>
         :param  concurrent_to  response WARC-Record-ID
-        '''
+        """
         warc_headers = [
             ('WARC-Type', 'request'),
             ('WARC-Target-URI', request.url),
@@ -267,18 +233,17 @@ class ScrapyWarcIo:
             ('WARC-Concurrent-To', concurrent_to),
         ]
 
-        content = '{}{}{}'.format(self.get_headers(request),
-                                  self.WARC_LINE_SEP * 2,
-                                  _str(request.body))
+        content = f'{self.get_headers(request)}{self.WARC_LINE_SEP * 2}{str(request.body)}'
 
-        self.write_record(headers=warc_headers,
-                          content_type='application/http;msgtype=request',
-                          content=content)
+        self.write_record(
+            headers=warc_headers,
+            content_type='application/http;msgtype=request',
+            content=content,
+        )
 
     def write_warcinfo(self):
-        '''
-        write WARC-Type: warcinfo record
-        '''
+        """Write WARC-Type: warcinfo record"""
+
         headers = [
             ('WARC-Type', 'warcinfo'),
             ('WARC-Date', warc_date()),
@@ -288,8 +253,6 @@ class ScrapyWarcIo:
 
         content = [
             'software: Scrapy/{} (+https://scrapy.org)'.format(scrapy_version),
-            'ip: {}'.format(socket.gethostbyname(socket.gethostname())),
-            'hostname: {}'.format(socket.gethostname()),
             'format: WARC file version 1.0',
             'conformsTo: {}'.format(self.config['warc_spec']),
             'operator: {}'.format(self.config['operator']),
@@ -299,6 +262,14 @@ class ScrapyWarcIo:
             'http-header-user-agent: {}'.format(self.config['user_agent']),
         ]
 
-        self.write_record(headers=headers,
-                          content_type='application/warc-fields',
-                          content=self.WARC_LINE_SEP.join(content))
+        self.write_record(
+            headers=headers,
+            content_type='application/warc-fields',
+            content=self.WARC_LINE_SEP.join(content),
+        )
+
+    @staticmethod
+    def __record_id():
+        """returns WARC-Record-ID (globally unique UUID) as a string"""
+
+        return f'<urn:uuid:{uuid.uuid1()}>'
